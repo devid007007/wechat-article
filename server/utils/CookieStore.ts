@@ -1,4 +1,4 @@
-import { H3Event, parseCookies } from 'h3';
+import { H3Event, parseCookies, getRequestHeader } from 'h3';
 import { CookieKVValue, getMpCookie, setMpCookie } from '~/server/kv/cookie';
 
 // 表示一条 set-cookie 记录的解析结果
@@ -45,7 +45,14 @@ export class AccountCookie {
 
   // 根据 cookie 中的 expires 来确定是否已过期
   public get isExpired(): boolean {
-    // todo
+    // 检查是否有 expires_timestamp
+    if (this._cookie.some(cookie => cookie.expires_timestamp)) {
+      const now = Date.now();
+      return this._cookie.some(cookie => 
+        cookie.expires_timestamp && cookie.expires_timestamp < now
+      );
+    }
+    // 如果没有 expires_timestamp，使用默认 30 天过期
     return false;
   }
 
@@ -124,6 +131,14 @@ class CookieStore {
 
       cachedAccountCookie = AccountCookie.create(cookieValue.token, cookieValue.cookies);
       this.store.set(authKey, cachedAccountCookie);
+    }
+
+    // 每次访问时检查是否过期，如果快过期则续期
+    if (cachedAccountCookie.isExpired || 
+        Date.now() > (cachedAccountCookie._cookie[0]?.expires_timestamp || 0) - 3600000) { // 提前 1 小时续期
+      await setMpCookie(authKey, cachedAccountCookie.toJSON(), {
+        expirationTtl: 60 * 60 * 24 * 4, // 续期 4 天
+      });
     }
 
     return cachedAccountCookie;
