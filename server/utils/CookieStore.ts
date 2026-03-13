@@ -1,27 +1,30 @@
 import { H3Event, parseCookies, getRequestHeader } from 'h3';
-import { CookieKVValue, getMpCookie, setMpCookie, deleteMpCookie } from '~/server/kv/cookie';
+import { CookieKVValue, getMpCookie, setMpCookie, deleteMpCookie, updateRefreshTime } from '~/server/kv/cookie';
 
-// 表示一条 set-cookie 记录的解析结果
 export type CookieEntity = Record<string, string | number>;
 
-// 公众号所有的 set-cookie 解析结果
+// 微信实际4天过期，我们3.5天（84小时）时自动刷新
+const WX_EXPIRE_HOURS = 84; 
+const WX_EXPIRE_MS = WX_EXPIRE_HOURS * 60 * 60 * 1000;
+
 export class AccountCookie {
   private readonly _token: string;
   private _cookie: CookieEntity[];
-  private readonly _createdAt: number; // 记录创建时间
+  private readonly _createdAt: number;
+  private _refreshedAt: number;
 
-  /**
-   * @param token
-   * @param cookies response.headers.getSetCookie() 的结果，是一个字符串数组
-   */
-  constructor(token: string, cookies: string[]) {
+  constructor(token: string, cookies: string[], createdAt?: number, refreshedAt?: number) {
     this._token = token;
     this._cookie = AccountCookie.parse(cookies);
-    this._createdAt = Date.now(); // 记录创建时间
+    this._createdAt = createdAt || Date.now();
+    this._refreshedAt = refreshedAt || this._createdAt;
   }
 
-  static create(token: string, cookies: CookieEntity[]): AccountCookie {
-    const value = new AccountCookie(token, []);
+  static create(token: string, cookies: CookieEntity[], createdAt?: number, refreshedAt?: number): AccountCookie {
+    const cookieStrings = cookies.map(c => 
+      `${c.name}=${c.value}; expires=${new Date(c.expires_timestamp as number).toUTCString()}`
+    );
+    const value = new AccountCookie(token, cookieStrings, createdAt, refreshedAt);
     value._cookie = cookies;
     return value;
   }
@@ -34,6 +37,8 @@ export class AccountCookie {
     return {
       token: this._token,
       cookies: this._cookie,
+      createdAt: this._createdAt,
+      refreshedAt: this._refreshedAt,
     };
   }
 
@@ -45,24 +50,25 @@ export class AccountCookie {
     return this._token;
   }
 
-  // 关键修改：强制1小时过期（解决微信服务端1小时失效问题）
-  public get isExpired(): boolean {
-    const ONE_HOUR = 60 * 60 * 1000; // 1小时 = 3600000毫秒
+  public get createdAt() {
+    return this._createdAt;
+  }
+
+  public get refreshedAt() {
+    return this._refreshedAt;
+  }
+
+  // 是否需要刷新（3.5天时返回true）
+  public get needsRefresh(): boolean {
     const now = Date.now();
-    
-    // 如果创建时间超过1小时，强制过期
-    if (now - this._createdAt > ONE_HOUR) {
-      return true;
-    }
-    
-    // 同时检查cookie自带的过期时间
-    if (this._cookie.some(cookie => cookie.expires_timestamp)) {
-      return this._cookie.some(cookie => 
-        cookie.expires_timestamp && cookie.expires_timestamp < now
-      );
-    }
-    
-    return false;
+    const timeSinceRefresh = now - this._refreshedAt;
+    return timeSinceRefresh > (WX_EXPIRE_MS - 12 * 60 * 60 * 1000); // 到期前12小时刷新
+  }
+
+  // 是否已过期（4天）
+  public get isExpired(): boolean {
+    const now = Date.now();
+    return (now - this._refreshedAt) > WX_EXPIRE_MS;
   }
 
   public static parse(cookies: string[]): CookieEntity[] {
@@ -93,7 +99,7 @@ export class AccountCookie {
                   cookieObj.expires_timestamp = timestamp;
                 }
               } catch (e) {
-                // 忽略解析失败
+                // 忽略
               }
             }
           }
@@ -116,28 +122,30 @@ export class AccountCookie {
   }
 }
 
-// 所有用户的 cookie 仓库
 class CookieStore {
   store: Map<string, AccountCookie> = new Map<string, AccountCookie>();
 
   async getAccountCookie(authKey: string): Promise<AccountCookie | null> {
-    // 优先从本地内存取
     let cachedAccountCookie = this.store.get(authKey);
 
-    // 如果内存没有，则从 kv 数据库取
     if (!cachedAccountCookie) {
       const cookieValue = await getMpCookie(authKey);
       if (!cookieValue) {
         return null;
       }
 
-      cachedAccountCookie = AccountCookie.create(cookieValue.token, cookieValue.cookies);
+      cachedAccountCookie = AccountCookie.create(
+        cookieValue.token, 
+        cookieValue.cookies,
+        cookieValue.createdAt,
+        cookieValue.refreshedAt
+      );
       this.store.set(authKey, cachedAccountCookie);
     }
 
-    // 检查是否过期，如果过期则删除
+    // 检查是否过期
     if (cachedAccountCookie.isExpired) {
-      console.log(`[CookieStore] Cookie expired for authKey: ${authKey}, clearing...`);
+      console.log(`[CookieStore] Cookie expired for authKey: ${authKey}`);
       await this.clearCookie(authKey);
       return null;
     }
@@ -145,11 +153,6 @@ class CookieStore {
     return cachedAccountCookie;
   }
 
-  /**
-   * 检索用户的cookie
-   * @param authKey
-   * @return 适合作为请求头的Cookie字符串
-   */
   async getCookie(authKey: string): Promise<string | null> {
     const accountCookie = await this.getAccountCookie(authKey);
     if (!accountCookie) {
@@ -158,46 +161,60 @@ class CookieStore {
     return accountCookie.toString();
   }
 
-  /**
-   * 存储用户的cookie
-   * @param authKey
-   * @param token
-   * @param cookie 原始的 set-cookie 字符串数组
-   */
   async setCookie(authKey: string, token: string, cookie: string[]): Promise<boolean> {
     const accountCookie = new AccountCookie(token, cookie);
     this.store.set(authKey, accountCookie);
-    // 存储到KV，设置4天过期（但我们会1小时后就认为失效）
     return await setMpCookie(authKey, accountCookie.toJSON(), {
-      expirationTtl: 60 * 60 * 24 * 4, // 4天
+      expirationTtl: 7 * 24 * 60 * 60, // 7天
     });
   }
 
-  /**
-   * 清除用户的cookie（新增方法）
-   * @param authKey
-   */
+  // 刷新cookie（更新刷新时间）
+  async refreshCookie(authKey: string): Promise<boolean> {
+    const accountCookie = this.store.get(authKey);
+    if (!accountCookie) {
+      return false;
+    }
+    
+    // 更新内存中的刷新时间
+    const refreshedCookie = new AccountCookie(
+      accountCookie.token,
+      accountCookie.toString().split('; '),
+      accountCookie.createdAt,
+      Date.now() // 新的刷新时间
+    );
+    this.store.set(authKey, refreshedCookie);
+    
+    // 更新存储
+    await updateRefreshTime(authKey);
+    console.log(`[CookieStore] Refreshed cookie for authKey: ${authKey}`);
+    return true;
+  }
+
   async clearCookie(authKey: string): Promise<void> {
     this.store.delete(authKey);
     await deleteMpCookie(authKey);
   }
 
-  /**
-   * 检索用户的 token
-   * @param authKey
-   */
   async getToken(authKey: string): Promise<string | null> {
     const accountCookie = await this.getAccountCookie(authKey);
     if (!accountCookie) {
       return null;
     }
-
     return accountCookie.token;
   }
 
-  /**
-   * 转换为 json 格式，方便存储与传输
-   */
+  // 获取所有需要刷新的cookie
+  getAllNeedRefresh(): string[] {
+    const result: string[] = [];
+    for (const [authKey, cookie] of this.store) {
+      if (cookie.needsRefresh) {
+        result.push(authKey);
+      }
+    }
+    return result;
+  }
+
   toJSON(): Record<string, AccountCookie> {
     const json: Record<string, AccountCookie> = {};
     for (const [authKey, accountCookie] of this.store) {
@@ -209,64 +226,44 @@ class CookieStore {
 
 export const cookieStore = new CookieStore();
 
-/**
- * 从 CookieStore 中获取 cookie 字符串
- * @param event
- */
 export async function getCookieFromStore(event: H3Event): Promise<string | null> {
   let cookie: string | null = null;
-
   let authKey = getRequestHeader(event, 'X-Auth-Key');
+  
   if (authKey) {
     cookie = await cookieStore.getCookie(authKey);
-    if (cookie) {
-      return cookie;
-    }
+    if (cookie) return cookie;
   }
 
   const cookies = parseCookies(event);
   authKey = cookies['auth-key'];
   if (authKey) {
     cookie = await cookieStore.getCookie(authKey);
-    if (cookie) {
-      return cookie;
-    }
+    if (cookie) return cookie;
   }
 
   return null;
 }
 
-/**
- * 从 CookieStore 中获取公众号的 token
- * @param event
- */
 export async function getTokenFromStore(event: H3Event): Promise<string | null> {
   let token: string | null = null;
-
   let authKey = getRequestHeader(event, 'X-Auth-Key');
+  
   if (authKey) {
     token = await cookieStore.getToken(authKey);
-    if (token) {
-      return token;
-    }
+    if (token) return token;
   }
 
   const cookies = parseCookies(event);
   authKey = cookies['auth-key'];
   if (authKey) {
     token = await cookieStore.getToken(authKey);
-    if (token) {
-      return token;
-    }
+    if (token) return token;
   }
 
   return null;
 }
 
-/**
- * 从请求中获取 cookie 字符串
- * @param event
- */
 export function getCookiesFromRequest(event: H3Event): string {
   const cookies = parseCookies(event);
   return Object.keys(cookies)
@@ -274,11 +271,6 @@ export function getCookiesFromRequest(event: H3Event): string {
     .join('; ');
 }
 
-/**
- * 从 response 中获取指定的 set-cookie 的 value 部分
- * @param name cookie 名
- * @param response
- */
 export function getCookieFromResponse(name: string, response: Response): string | null {
   const cookies = AccountCookie.parse(response.headers.getSetCookie());
   const targetCookie = cookies.find(cookie => cookie.name === name);
